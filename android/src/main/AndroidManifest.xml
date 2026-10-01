@@ -5,6 +5,7 @@
         android:allowBackup="true"
         android:label="SpendCore"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.SpendCore">
         <activity
             android:name=".MainActivity"
