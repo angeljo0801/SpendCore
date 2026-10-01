@@ -42,6 +42,22 @@ def test_provider_status_and_card_sync():
     assert synced["synced"] >= 1
 
 
+def test_marqeta_webhook_accepts_json_and_is_idempotent():
+    _, _, purchase = create_flow()
+    card_ref = purchase["card_intent"]["provider_ref"]
+    event = {
+        "token": "evt-webhook-1",
+        "type": "cardtransition",
+        "card": {"token": card_ref, "state": "ACTIVE", "last_four": "4321"},
+    }
+    first = client.post("/v1/webhooks/marqeta", json=event)
+    assert first.status_code == 200
+    assert first.json()["processed"] == 1
+    second = client.post("/v1/webhooks/marqeta", json=event)
+    assert second.status_code == 200
+    assert second.json()["skipped"] == 1
+
+
 def test_end_to_end_purchase_capture_refund():
     _, budget, purchase = create_flow()
     assert purchase["status"] == "APPROVED"
