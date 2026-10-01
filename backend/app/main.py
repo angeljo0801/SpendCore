@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from .engine import authorize
@@ -294,7 +294,7 @@ def refund_purchase(purchase_id: str, body: RefundRequest):
 
 @app.post("/v1/webhooks/marqeta")
 def marqeta_webhook(
-    payload: Any,
+    payload: Any = Body(...),
     credentials: HTTPBasicCredentials | None = Depends(webhook_security),
 ):
     expected_user = os.environ.get("MARQETA_WEBHOOK_USERNAME", "")
