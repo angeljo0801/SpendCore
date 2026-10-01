@@ -110,8 +110,8 @@ fun CardsScreen(state: AppState) {
                         modifier = Modifier.fillMaxWidth()
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { state.setApiBaseUrl(urlField); message = "Servidor guardado" }) { Text("Guardar") }
-                        OutlinedButton(onClick = { state.setApiBaseUrl(urlField); refresh() }, enabled = !busy) {
+                        Button(onClick = { state.saveApiBaseUrl(urlField); message = "Servidor guardado" }) { Text("Guardar") }
+                        OutlinedButton(onClick = { state.saveApiBaseUrl(urlField); refresh() }, enabled = !busy) {
                             Icon(Icons.Default.Sync, null); Spacer(Modifier.width(5.dp)); Text("Sincronizar")
                         }
                     }
@@ -133,7 +133,7 @@ fun CardsScreen(state: AppState) {
                         Text("${state.customerName(p.customerId)} · ${p.merchant}", fontWeight = FontWeight.Bold)
                         Text("${money(p.amountCents)} · ${state.orderById(p.orderId)?.orderRef ?: p.orderId}")
                         Button(onClick = { issue(p) }, enabled = !busy && state.apiBaseUrl.isNotBlank()) {
-                            Icon(Icons.Default.AddCard, null); Spacer(Modifier.width(6.dp)); Text("Emitir tarjeta en servidor")
+                            Icon(Icons.Default.CreditCard, null); Spacer(Modifier.width(6.dp)); Text("Emitir tarjeta en servidor")
                         }
                     }
                 }
