@@ -63,6 +63,14 @@ class Store:
                 return purchase
         return None
 
+    def find_purchase_by_external_order_ref(self, business_id: str, external_order_ref: str):
+        if not external_order_ref:
+            return None
+        for purchase in self.list_purchases():
+            if purchase.business_id == business_id and purchase.external_order_ref == external_order_ref:
+                return purchase
+        return None
+
     def add_audit(self, event: AuditEvent):
         with self.lock, self._connect() as conn:
             conn.execute(
