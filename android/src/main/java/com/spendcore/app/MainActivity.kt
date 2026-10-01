@@ -24,6 +24,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 
 class MainActivity : ComponentActivity() {
@@ -35,7 +36,8 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun SpendCoreApp() {
-    val state = remember { AppState(androidx.compose.ui.platform.LocalContext.current.applicationContext) }
+    val context = LocalContext.current.applicationContext
+    val state = remember(context) { AppState(context) }
     MaterialTheme {
         Scaffold(
             topBar = {
