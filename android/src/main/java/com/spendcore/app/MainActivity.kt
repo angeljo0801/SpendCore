@@ -78,19 +78,59 @@ class AppState(private val context: Context) {
         if (selectedBusinessId == null) selectedBusinessId = businesses.firstOrNull()?.id
     }
 
-    fun addBusiness(name: String): Business {
-        val business = Business(id("BUS"), name.trim())
+    fun addBusiness(name: String): Business? {
+        val clean = name.trim()
+        if (clean.isBlank()) return null
+        val business = Business(id("BUS"), clean)
         businesses.add(business)
         if (selectedBusinessId == null) selectedBusinessId = business.id
         save()
         return business
     }
 
-    fun addCustomer(businessId: String, name: String): Customer {
-        val customer = Customer(id("CUS"), businessId, name.trim())
+    fun updateBusiness(businessId: String, name: String): Boolean {
+        val clean = name.trim()
+        val index = businesses.indexOfFirst { it.id == businessId }
+        if (index < 0 || clean.isBlank()) return false
+        businesses[index] = businesses[index].copy(name = clean)
+        save()
+        return true
+    }
+
+    fun deleteBusiness(businessId: String) {
+        purchases.removeAll { it.businessId == businessId }
+        orders.removeAll { it.businessId == businessId }
+        customers.removeAll { it.businessId == businessId }
+        businesses.removeAll { it.id == businessId }
+        if (selectedBusinessId == businessId) selectedBusinessId = businesses.firstOrNull()?.id
+        save()
+    }
+
+    fun addCustomer(businessId: String, name: String): Customer? {
+        if (businesses.none { it.id == businessId }) return null
+        val clean = name.trim()
+        if (clean.isBlank()) return null
+        val customer = Customer(id("CUS"), businessId, clean)
         customers.add(customer)
         save()
         return customer
+    }
+
+    fun updateCustomer(customerId: String, name: String): Boolean {
+        val clean = name.trim()
+        val index = customers.indexOfFirst { it.id == customerId }
+        if (index < 0 || clean.isBlank()) return false
+        customers[index] = customers[index].copy(name = clean)
+        save()
+        return true
+    }
+
+    fun deleteCustomer(customerId: String) {
+        val orderIds = orders.filter { it.customerId == customerId }.map { it.id }.toSet()
+        purchases.removeAll { it.customerId == customerId || it.orderId in orderIds }
+        orders.removeAll { it.customerId == customerId }
+        customers.removeAll { it.id == customerId }
+        save()
     }
 
     fun addOrder(customerId: String, paidCents: Long, limitCents: Long): SpendOrder? {
@@ -109,6 +149,33 @@ class AppState(private val context: Context) {
         return order
     }
 
+    fun updateOrder(orderId: String, paidCents: Long, limitCents: Long): String {
+        val index = orders.indexOfFirst { it.id == orderId }
+        if (index < 0) return "Orden no encontrada"
+        val order = orders[index]
+        if (paidCents <= 0 || limitCents <= 0) return "Los montos deben ser mayores que cero"
+        if (paidCents < limitCents) return "El pago no puede ser menor que el máximo autorizado"
+        if (limitCents < order.usedCents + order.reservedCents) {
+            return "El máximo no puede quedar por debajo de lo ya usado o reservado"
+        }
+        orders[index] = order.copy(paidCents = paidCents, purchaseLimitCents = limitCents)
+        save()
+        return "Orden actualizada"
+    }
+
+    fun setOrderActive(orderId: String, active: Boolean) {
+        val index = orders.indexOfFirst { it.id == orderId }
+        if (index < 0) return
+        orders[index] = orders[index].copy(status = if (active) "ACTIVE" else "PAUSED")
+        save()
+    }
+
+    fun deleteOrder(orderId: String) {
+        purchases.removeAll { it.orderId == orderId }
+        orders.removeAll { it.id == orderId }
+        save()
+    }
+
     fun authorizePurchase(orderId: String, merchant: String, description: String, amountCents: Long): String {
         val index = orders.indexOfFirst { it.id == orderId }
         if (index < 0) return "Orden no encontrada"
@@ -116,14 +183,12 @@ class AppState(private val context: Context) {
         if (order.status != "ACTIVE") return "La orden no está activa"
         if (amountCents <= 0) return "El monto debe ser mayor que cero"
         if (amountCents > order.remainingCents) return "Compra rechazada: excede el presupuesto restante"
-        if (merchant.trim().isBlank()) return "Escribe el comercio"
-
         val normalized = merchant.trim()
-        val permitted = allowedMerchants.any { normalized.contains(it, ignoreCase = true) || it.contains(normalized, ignoreCase = true) }
-        if (!permitted) return "Compra rechazada: comercio no permitido por las reglas"
+        if (normalized.isBlank()) return "Escribe el comercio"
+        if (!merchantPermitted(normalized)) return "Compra rechazada: comercio no permitido por las reglas"
 
         orders[index] = order.copy(reservedCents = order.reservedCents + amountCents)
-        purchases.add(0, Purchase(
+        val purchase = Purchase(
             id = id("PUR"),
             orderId = order.id,
             businessId = order.businessId,
@@ -133,9 +198,43 @@ class AppState(private val context: Context) {
             amountCents = amountCents,
             status = "AUTHORIZED",
             cardLast4 = (1000..9999).random().toString()
-        ))
+        )
+        purchases.add(0, purchase)
         save()
-        return "Autorizada. Tarjeta virtual temporal •••• ${purchases.first().cardLast4}"
+        return "Autorizada. Tarjeta virtual temporal •••• ${purchase.cardLast4}"
+    }
+
+    fun updatePurchase(purchaseId: String, merchant: String, description: String, amountCents: Long): String {
+        val pIndex = purchases.indexOfFirst { it.id == purchaseId }
+        if (pIndex < 0) return "Compra no encontrada"
+        val purchase = purchases[pIndex]
+        val normalized = merchant.trim()
+        if (normalized.isBlank()) return "Escribe el comercio"
+
+        if (purchase.status != "AUTHORIZED") {
+            purchases[pIndex] = purchase.copy(description = description.trim())
+            save()
+            return "Descripción actualizada. Una compra procesada no puede cambiar monto o comercio."
+        }
+
+        if (amountCents <= 0) return "El monto debe ser mayor que cero"
+        if (!merchantPermitted(normalized)) return "Comercio no permitido por las reglas"
+        val oIndex = orders.indexOfFirst { it.id == purchase.orderId }
+        if (oIndex < 0) return "Orden no encontrada"
+        val order = orders[oIndex]
+        val availableIncludingThisPurchase = order.remainingCents + purchase.amountCents
+        if (amountCents > availableIncludingThisPurchase) return "El nuevo monto excede el presupuesto disponible"
+
+        orders[oIndex] = order.copy(
+            reservedCents = (order.reservedCents - purchase.amountCents + amountCents).coerceAtLeast(0)
+        )
+        purchases[pIndex] = purchase.copy(
+            merchant = normalized,
+            description = description.trim(),
+            amountCents = amountCents
+        )
+        save()
+        return "Compra actualizada"
     }
 
     fun capturePurchase(purchaseId: String) {
@@ -182,12 +281,39 @@ class AppState(private val context: Context) {
         save()
     }
 
+    fun deletePurchase(purchaseId: String) {
+        val pIndex = purchases.indexOfFirst { it.id == purchaseId }
+        if (pIndex < 0) return
+        val purchase = purchases[pIndex]
+        val oIndex = orders.indexOfFirst { it.id == purchase.orderId }
+        if (oIndex >= 0) {
+            val order = orders[oIndex]
+            orders[oIndex] = when (purchase.status) {
+                "AUTHORIZED" -> order.copy(reservedCents = (order.reservedCents - purchase.amountCents).coerceAtLeast(0))
+                "CAPTURED" -> order.copy(usedCents = (order.usedCents - purchase.amountCents).coerceAtLeast(0))
+                else -> order
+            }
+        }
+        purchases.removeAt(pIndex)
+        save()
+    }
+
     fun addAllowedMerchant(name: String) {
         val clean = name.trim()
         if (clean.isNotBlank() && allowedMerchants.none { it.equals(clean, true) }) {
             allowedMerchants.add(clean)
             save()
         }
+    }
+
+    fun updateAllowedMerchant(old: String, new: String): Boolean {
+        val clean = new.trim()
+        val index = allowedMerchants.indexOf(old)
+        if (index < 0 || clean.isBlank()) return false
+        if (allowedMerchants.any { !it.equals(old, true) && it.equals(clean, true) }) return false
+        allowedMerchants[index] = clean
+        save()
+        return true
     }
 
     fun removeAllowedMerchant(name: String) {
@@ -198,8 +324,27 @@ class AppState(private val context: Context) {
     fun businessName(id: String): String = businesses.firstOrNull { it.id == id }?.name ?: "Negocio"
     fun customerName(id: String): String = customers.firstOrNull { it.id == id }?.name ?: "Cliente"
     fun orderById(id: String): SpendOrder? = orders.firstOrNull { it.id == id }
+    fun customerCascadeCount(customerId: String): Pair<Int, Int> {
+        val customerOrders = orders.count { it.customerId == customerId }
+        val customerPurchases = purchases.count { it.customerId == customerId }
+        return customerOrders to customerPurchases
+    }
+    fun businessCascadeCount(businessId: String): Triple<Int, Int, Int> = Triple(
+        customers.count { it.businessId == businessId },
+        orders.count { it.businessId == businessId },
+        purchases.count { it.businessId == businessId }
+    )
 
-    private fun nextOrderRef(): String = "SC-${(orders.size + 1).toString().padStart(4, '0')}"
+    private fun merchantPermitted(name: String): Boolean = allowedMerchants.any {
+        name.contains(it, ignoreCase = true) || it.contains(name, ignoreCase = true)
+    }
+
+    private fun nextOrderRef(): String {
+        var n = orders.size + 1
+        while (orders.any { it.orderRef == "SC-${n.toString().padStart(4, '0')}" }) n++
+        return "SC-${n.toString().padStart(4, '0')}"
+    }
+
     private fun id(prefix: String): String = "$prefix-${UUID.randomUUID().toString().take(8).uppercase()}"
 
     private fun save() {
@@ -226,11 +371,7 @@ class AppState(private val context: Context) {
         val raw = prefs.getString("state", null) ?: return
         runCatching {
             val root = JSONObject(raw)
-            businesses.clear()
-            customers.clear()
-            orders.clear()
-            purchases.clear()
-            allowedMerchants.clear()
+            businesses.clear(); customers.clear(); orders.clear(); purchases.clear(); allowedMerchants.clear()
             root.optJSONArray("businesses")?.forEachObject { businesses.add(Business(it.getString("id"), it.getString("name"))) }
             root.optJSONArray("customers")?.forEachObject { customers.add(Customer(it.getString("id"), it.getString("businessId"), it.getString("name"))) }
             root.optJSONArray("orders")?.forEachObject {
@@ -262,25 +403,22 @@ fun SpendCoreApp(context: Context) {
     MaterialTheme {
         Scaffold(
             topBar = {
-                TopAppBar(
-                    title = {
-                        Column {
-                            Text("SpendCore", fontWeight = FontWeight.Bold)
-                            Text("v0.2 · MOCK", style = MaterialTheme.typography.labelSmall)
-                        }
+                TopAppBar(title = {
+                    Column {
+                        Text("SpendCore", fontWeight = FontWeight.Bold)
+                        Text("v0.3 · MOCK", style = MaterialTheme.typography.labelSmall)
                     }
-                )
+                })
             },
             bottomBar = {
                 NavigationBar {
-                    val tabs = listOf(
+                    listOf(
                         Triple("Inicio", Icons.Default.Dashboard, 0),
                         Triple("Negocios", Icons.Default.Business, 1),
                         Triple("Órdenes", Icons.Default.ReceiptLong, 2),
                         Triple("Compras", Icons.Default.ShoppingCart, 3),
                         Triple("Reglas", Icons.Default.Rule, 4)
-                    )
-                    tabs.forEach { (label, icon, index) ->
+                    ).forEach { (label, icon, index) ->
                         NavigationBarItem(
                             selected = state.selectedTab == index,
                             onClick = { state.selectedTab = index },
@@ -306,51 +444,39 @@ fun SpendCoreApp(context: Context) {
 
 @Composable
 private fun DashboardScreen(state: AppState) {
-    val orders = state.orders.filter { state.selectedBusinessId == null || it.businessId == state.selectedBusinessId }
-    val authorized = orders.sumOf { it.purchaseLimitCents }
-    val used = orders.sumOf { it.usedCents }
-    val reserved = orders.sumOf { it.reservedCents }
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
+    val visible = state.orders.filter { state.selectedBusinessId == null || it.businessId == state.selectedBusinessId }
+    val authorized = visible.sumOf { it.purchaseLimitCents }
+    val used = visible.sumOf { it.usedCents }
+    val reserved = visible.sumOf { it.reservedCents }
+    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Text("Control de compras", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            Text("Los presupuestos son límites internos de autorización del negocio, no saldos bancarios del cliente.")
+            Text("Presupuestos internos del negocio; no son saldos bancarios transferibles del cliente.")
         }
-        if (state.businesses.isEmpty()) {
-            item { EmptyCard("Empieza creando tu primer negocio en la pestaña Negocios.") }
-        } else {
+        if (state.businesses.isEmpty()) item { EmptyCard("Empieza creando tu primer negocio.") }
+        else {
             item { BusinessSelector(state) }
             item { MetricCard("Autorizado", money(authorized), Icons.Default.Speed) }
             item { MetricCard("Usado", money(used), Icons.Default.ReceiptLong) }
             item { MetricCard("Reservado", money(reserved), Icons.Default.LockClock) }
             item { MetricCard("Disponible para compras", money((authorized - used - reserved).coerceAtLeast(0)), Icons.Default.VerifiedUser) }
-            item { Text("Provider: MOCK · las tarjetas son simuladas hasta conectar un issuer real.", style = MaterialTheme.typography.bodySmall) }
+            item { Text("Provider: MOCK · ninguna tarjeta real se emite todavía.", style = MaterialTheme.typography.bodySmall) }
         }
     }
 }
 
 @Composable
 private fun BusinessSelector(state: AppState) {
+    if (state.businesses.isEmpty()) return
     var expanded by remember { mutableStateOf(false) }
     val current = state.businesses.firstOrNull { it.id == state.selectedBusinessId } ?: state.businesses.first()
     Box {
         OutlinedButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth()) {
-            Icon(Icons.Default.Business, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text(current.name, modifier = Modifier.weight(1f))
-            Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+            Icon(Icons.Default.Business, null); Spacer(Modifier.width(8.dp)); Text(current.name, Modifier.weight(1f)); Icon(Icons.Default.ArrowDropDown, null)
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             state.businesses.forEach { business ->
-                DropdownMenuItem(
-                    text = { Text(business.name) },
-                    onClick = {
-                        state.selectedBusinessId = business.id
-                        expanded = false
-                    }
-                )
+                DropdownMenuItem(text = { Text(business.name) }, onClick = { state.selectedBusinessId = business.id; expanded = false })
             }
         }
     }
@@ -358,19 +484,21 @@ private fun BusinessSelector(state: AppState) {
 
 @Composable
 private fun BusinessesScreen(state: AppState) {
-    var showBusinessDialog by remember { mutableStateOf(false) }
-    var customerBusiness by remember { mutableStateOf<Business?>(null) }
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
+    var addBusiness by remember { mutableStateOf(false) }
+    var addCustomerTo by remember { mutableStateOf<Business?>(null) }
+    var editBusiness by remember { mutableStateOf<Business?>(null) }
+    var deleteBusiness by remember { mutableStateOf<Business?>(null) }
+    var editCustomer by remember { mutableStateOf<Customer?>(null) }
+    var deleteCustomer by remember { mutableStateOf<Customer?>(null) }
+
+    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Negocios y clientes", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                    Text("Cada negocio mantiene sus propias órdenes y límites.")
+                    Text("Puedes corregir o eliminar registros creados por error.")
                 }
-                FilledTonalIconButton(onClick = { showBusinessDialog = true }) { Icon(Icons.Default.Add, contentDescription = "Añadir negocio") }
+                FilledTonalIconButton(onClick = { addBusiness = true }) { Icon(Icons.Default.Add, "Añadir negocio") }
             }
         }
         if (state.businesses.isEmpty()) item { EmptyCard("No hay negocios todavía.") }
@@ -378,42 +506,63 @@ private fun BusinessesScreen(state: AppState) {
             val clients = state.customers.filter { it.businessId == business.id }
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(business.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("${clients.size} cliente(s)")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(business.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text("${clients.size} cliente(s)")
+                        }
+                        IconButton(onClick = { editBusiness = business }) { Icon(Icons.Default.Edit, "Editar negocio") }
+                        IconButton(onClick = { deleteBusiness = business }) { Icon(Icons.Default.DeleteOutline, "Borrar negocio") }
+                    }
                     clients.forEach { client ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Person, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(client.name)
+                            Icon(Icons.Default.Person, null); Spacer(Modifier.width(8.dp)); Text(client.name, Modifier.weight(1f))
+                            IconButton(onClick = { editCustomer = client }) { Icon(Icons.Default.Edit, "Editar cliente") }
+                            IconButton(onClick = { deleteCustomer = client }) { Icon(Icons.Default.DeleteOutline, "Borrar cliente") }
                         }
                     }
-                    OutlinedButton(onClick = { customerBusiness = business }) {
-                        Icon(Icons.Default.PersonAdd, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("Añadir cliente")
+                    OutlinedButton(onClick = { addCustomerTo = business }) {
+                        Icon(Icons.Default.PersonAdd, null); Spacer(Modifier.width(6.dp)); Text("Añadir cliente")
                     }
                 }
             }
         }
     }
-    if (showBusinessDialog) NameDialog(
-        title = "Nuevo negocio",
-        label = "Nombre del negocio",
-        onDismiss = { showBusinessDialog = false },
-        onSave = {
-            state.addBusiness(it)
-            showBusinessDialog = false
+
+    if (addBusiness) NameDialog("Nuevo negocio", "Nombre del negocio", "", { addBusiness = false }) {
+        state.addBusiness(it); addBusiness = false
+    }
+    addCustomerTo?.let { business ->
+        NameDialog("Nuevo cliente · ${business.name}", "Nombre del cliente", "", { addCustomerTo = null }) {
+            state.addCustomer(business.id, it); addCustomerTo = null
         }
-    )
-    customerBusiness?.let { business ->
-        NameDialog(
-            title = "Nuevo cliente · ${business.name}",
-            label = "Nombre del cliente",
-            onDismiss = { customerBusiness = null },
-            onSave = {
-                state.addCustomer(business.id, it)
-                customerBusiness = null
-            }
+    }
+    editBusiness?.let { business ->
+        NameDialog("Editar negocio", "Nombre del negocio", business.name, { editBusiness = null }) {
+            state.updateBusiness(business.id, it); editBusiness = null
+        }
+    }
+    editCustomer?.let { customer ->
+        NameDialog("Editar cliente", "Nombre del cliente", customer.name, { editCustomer = null }) {
+            state.updateCustomer(customer.id, it); editCustomer = null
+        }
+    }
+    deleteBusiness?.let { business ->
+        val (clients, orders, purchases) = state.businessCascadeCount(business.id)
+        ConfirmDeleteDialog(
+            title = "Borrar ${business.name}",
+            message = "También se borrarán $clients cliente(s), $orders orden(es) y $purchases compra(s) asociadas. Esta acción no se puede deshacer.",
+            onDismiss = { deleteBusiness = null },
+            onConfirm = { state.deleteBusiness(business.id); deleteBusiness = null }
+        )
+    }
+    deleteCustomer?.let { customer ->
+        val (orders, purchases) = state.customerCascadeCount(customer.id)
+        ConfirmDeleteDialog(
+            title = "Borrar ${customer.name}",
+            message = "También se borrarán $orders orden(es) y $purchases compra(s) asociadas.",
+            onDismiss = { deleteCustomer = null },
+            onConfirm = { state.deleteCustomer(customer.id); deleteCustomer = null }
         )
     }
 }
@@ -422,42 +571,58 @@ private fun BusinessesScreen(state: AppState) {
 private fun OrdersScreen(state: AppState) {
     var showNew by remember { mutableStateOf(false) }
     var purchaseOrder by remember { mutableStateOf<SpendOrder?>(null) }
+    var editOrder by remember { mutableStateOf<SpendOrder?>(null) }
+    var deleteOrder by remember { mutableStateOf<SpendOrder?>(null) }
     val visible = state.orders.filter { state.selectedBusinessId == null || it.businessId == state.selectedBusinessId }
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
+
+    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Órdenes de servicio", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                    Text("Ejemplo: cliente paga $630 y autorizas hasta $600 en mercancía.")
+                    Text("Ejemplo: cliente paga $630 y autorizas hasta $600.")
                 }
-                FilledTonalIconButton(onClick = { showNew = true }, enabled = state.customers.isNotEmpty()) { Icon(Icons.Default.Add, contentDescription = "Nueva orden") }
+                FilledTonalIconButton(onClick = { showNew = true }, enabled = state.customers.isNotEmpty()) { Icon(Icons.Default.Add, "Nueva orden") }
             }
         }
         if (state.businesses.isNotEmpty()) item { BusinessSelector(state) }
-        if (visible.isEmpty()) item { EmptyCard(if (state.customers.isEmpty()) "Primero crea un negocio y un cliente." else "No hay órdenes para este negocio.") }
+        if (visible.isEmpty()) item { EmptyCard(if (state.customers.isEmpty()) "Primero crea un negocio y cliente." else "No hay órdenes para este negocio.") }
         items(visible, key = { it.id }) { order ->
-            OrderCard(state, order, onNewPurchase = { purchaseOrder = order })
+            OrderCard(
+                state = state,
+                order = order,
+                onNewPurchase = { purchaseOrder = order },
+                onEdit = { editOrder = order },
+                onDelete = { deleteOrder = order }
+            )
         }
     }
-    if (showNew) NewOrderDialog(state, onDismiss = { showNew = false })
-    purchaseOrder?.let { order ->
-        NewPurchaseDialog(state, order, onDismiss = { purchaseOrder = null })
+    if (showNew) NewOrderDialog(state) { showNew = false }
+    purchaseOrder?.let { NewPurchaseDialog(state, it) { purchaseOrder = null } }
+    editOrder?.let { EditOrderDialog(state, it) { editOrder = null } }
+    deleteOrder?.let { order ->
+        val count = state.purchases.count { it.orderId == order.id }
+        ConfirmDeleteDialog(
+            "Borrar ${order.orderRef}",
+            "También se borrarán $count compra(s) asociadas a esta orden.",
+            { deleteOrder = null },
+            { state.deleteOrder(order.id); deleteOrder = null }
+        )
     }
 }
 
 @Composable
-private fun OrderCard(state: AppState, order: SpendOrder, onNewPurchase: () -> Unit) {
+private fun OrderCard(state: AppState, order: SpendOrder, onNewPurchase: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
                     Text(order.orderRef, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
                     Text(state.customerName(order.customerId))
                 }
                 AssistChip(onClick = {}, label = { Text(order.status) })
+                IconButton(onClick = onEdit) { Icon(Icons.Default.Edit, "Editar orden") }
+                IconButton(onClick = onDelete) { Icon(Icons.Default.DeleteOutline, "Borrar orden") }
             }
             LinearProgressIndicator(
                 progress = { (order.usedCents + order.reservedCents).toFloat() / order.purchaseLimitCents.coerceAtLeast(1) },
@@ -467,11 +632,14 @@ private fun OrderCard(state: AppState, order: SpendOrder, onNewPurchase: () -> U
             Text("Máximo mercancía: ${money(order.purchaseLimitCents)}")
             Text("Servicio/diferencia: ${money(order.feeCents)} (${String.format(Locale.US, "%.2f", order.feePercent)}%)")
             Text("Usado ${money(order.usedCents)} · Reservado ${money(order.reservedCents)}")
-            Text("Disponible para compras: ${money(order.remainingCents)}", fontWeight = FontWeight.Bold)
-            Button(onClick = onNewPurchase, enabled = order.remainingCents > 0) {
-                Icon(Icons.Default.CreditCard, contentDescription = null)
-                Spacer(Modifier.width(6.dp))
-                Text("Nueva compra / tarjeta temporal")
+            Text("Disponible: ${money(order.remainingCents)}", fontWeight = FontWeight.Bold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onNewPurchase, enabled = order.status == "ACTIVE" && order.remainingCents > 0, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.CreditCard, null); Spacer(Modifier.width(5.dp)); Text("Nueva compra")
+                }
+                OutlinedButton(onClick = { state.setOrderActive(order.id, order.status != "ACTIVE") }) {
+                    Text(if (order.status == "ACTIVE") "Pausar" else "Reactivar")
+                }
             }
         }
     }
@@ -479,27 +647,29 @@ private fun OrderCard(state: AppState, order: SpendOrder, onNewPurchase: () -> U
 
 @Composable
 private fun PurchasesScreen(state: AppState) {
+    var editPurchase by remember { mutableStateOf<Purchase?>(null) }
+    var deletePurchase by remember { mutableStateOf<Purchase?>(null) }
     val visible = state.purchases.filter { state.selectedBusinessId == null || it.businessId == state.selectedBusinessId }
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
+
+    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             Text("Compras y tarjetas", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            Text("Cada compra autorizada crea una tarjeta virtual simulada de propósito único.")
+            Text("Cada autorización crea una tarjeta virtual simulada de propósito único.")
         }
         if (state.businesses.isNotEmpty()) item { BusinessSelector(state) }
-        if (visible.isEmpty()) item { EmptyCard("No hay compras todavía. Créala desde una orden.") }
+        if (visible.isEmpty()) item { EmptyCard("No hay compras todavía.") }
         items(visible, key = { it.id }) { purchase ->
             val order = state.orderById(purchase.orderId)
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(purchase.merchant, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
                             Text("${state.customerName(purchase.customerId)} · ${order?.orderRef ?: purchase.orderId}")
                         }
                         Text(money(purchase.amountCents), fontWeight = FontWeight.Bold)
+                        IconButton(onClick = { editPurchase = purchase }) { Icon(Icons.Default.Edit, "Editar compra") }
+                        IconButton(onClick = { deletePurchase = purchase }) { Icon(Icons.Default.DeleteOutline, "Borrar compra") }
                     }
                     if (purchase.description.isNotBlank()) Text(purchase.description)
                     Text("Tarjeta virtual •••• ${purchase.cardLast4} · single-use", style = MaterialTheme.typography.bodySmall)
@@ -511,9 +681,7 @@ private fun PurchasesScreen(state: AppState) {
                                 OutlinedButton(onClick = { state.cancelPurchase(purchase.id) }) { Text("Cancelar") }
                             }
                             "CAPTURED" -> OutlinedButton(onClick = { state.refundPurchase(purchase.id) }) {
-                                Icon(Icons.Default.Undo, contentDescription = null)
-                                Spacer(Modifier.width(4.dp))
-                                Text("Reembolso")
+                                Icon(Icons.Default.Undo, null); Spacer(Modifier.width(4.dp)); Text("Reembolso")
                             }
                         }
                     }
@@ -521,31 +689,42 @@ private fun PurchasesScreen(state: AppState) {
             }
         }
     }
+    editPurchase?.let { EditPurchaseDialog(state, it) { editPurchase = null } }
+    deletePurchase?.let { purchase ->
+        ConfirmDeleteDialog(
+            "Borrar compra",
+            "Se eliminará ${purchase.merchant} por ${money(purchase.amountCents)}. En MOCK SpendCore ajustará automáticamente lo reservado/usado.",
+            { deletePurchase = null },
+            { state.deletePurchase(purchase.id); deletePurchase = null }
+        )
+    }
 }
 
 @Composable
 private fun RulesScreen(state: AppState) {
     var showAdd by remember { mutableStateOf(false) }
-    LazyColumn(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
+    var editMerchant by remember { mutableStateOf<String?>(null) }
+    var deleteMerchant by remember { mutableStateOf<String?>(null) }
+    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Reglas de gasto", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                    Text("En MOCK se valida por nombre del comercio; un issuer real usaría MCC/merchant controls.")
+                    Text("En MOCK se valida por nombre; un issuer real usaría merchant/MCC controls.")
                 }
-                FilledTonalIconButton(onClick = { showAdd = true }) { Icon(Icons.Default.Add, contentDescription = "Añadir comercio") }
+                FilledTonalIconButton(onClick = { showAdd = true }) { Icon(Icons.Default.Add, "Añadir comercio") }
             }
         }
         items(state.allowedMerchants.toList()) { merchant ->
             ListItem(
                 headlineContent = { Text(merchant) },
                 supportingContent = { Text("Comercio permitido") },
-                leadingContent = { Icon(Icons.Default.CheckCircle, contentDescription = null) },
+                leadingContent = { Icon(Icons.Default.CheckCircle, null) },
                 trailingContent = {
-                    IconButton(onClick = { state.removeAllowedMerchant(merchant) }) { Icon(Icons.Default.DeleteOutline, contentDescription = "Eliminar") }
+                    Row {
+                        IconButton(onClick = { editMerchant = merchant }) { Icon(Icons.Default.Edit, "Editar") }
+                        IconButton(onClick = { deleteMerchant = merchant }) { Icon(Icons.Default.DeleteOutline, "Eliminar") }
+                    }
                 }
             )
         }
@@ -555,68 +734,91 @@ private fun RulesScreen(state: AppState) {
         item { RuleLine("Depósitos externos", false) }
         item { RuleLine("Transferir presupuesto a otro cliente", false) }
         item { RuleLine("Tarjetas temporales por compra", true) }
-        item { Text("Importante: estas restricciones son de producto. La clasificación regulatoria real depende del flujo de fondos, contratos e issuer del programa.", style = MaterialTheme.typography.bodySmall) }
+        item { Text("Las operaciones reales requerirán issuer/proveedor aprobado; en producción las transacciones financieras se auditan en vez de borrarse.", style = MaterialTheme.typography.bodySmall) }
     }
-    if (showAdd) NameDialog(
-        title = "Permitir comercio",
-        label = "Nombre del comercio",
-        onDismiss = { showAdd = false },
-        onSave = {
-            state.addAllowedMerchant(it)
-            showAdd = false
+    if (showAdd) NameDialog("Permitir comercio", "Nombre del comercio", "", { showAdd = false }) { state.addAllowedMerchant(it); showAdd = false }
+    editMerchant?.let { old ->
+        NameDialog("Editar comercio", "Nombre del comercio", old, { editMerchant = null }) {
+            state.updateAllowedMerchant(old, it); editMerchant = null
         }
-    )
+    }
+    deleteMerchant?.let { merchant ->
+        ConfirmDeleteDialog("Eliminar comercio", "Se quitará $merchant de la lista de comercios permitidos.", { deleteMerchant = null }) {
+            state.removeAllowedMerchant(merchant); deleteMerchant = null
+        }
+    }
 }
 
 @Composable
 private fun NewOrderDialog(state: AppState, onDismiss: () -> Unit) {
-    val availableCustomers = state.customers.filter { state.selectedBusinessId == null || it.businessId == state.selectedBusinessId }
-    var customerId by remember { mutableStateOf(availableCustomers.firstOrNull()?.id ?: "") }
+    val available = state.customers.filter { state.selectedBusinessId == null || it.businessId == state.selectedBusinessId }
+    var customerId by remember { mutableStateOf(available.firstOrNull()?.id ?: "") }
     var paid by remember { mutableStateOf("630.00") }
     var limit by remember { mutableStateOf("600.00") }
     var error by remember { mutableStateOf<String?>(null) }
-    var customerMenu by remember { mutableStateOf(false) }
-    val selectedCustomer = availableCustomers.firstOrNull { it.id == customerId }
+    var menu by remember { mutableStateOf(false) }
+    val selected = available.firstOrNull { it.id == customerId }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Nueva orden de servicio") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Box {
-                    OutlinedButton(onClick = { customerMenu = true }, modifier = Modifier.fillMaxWidth()) {
-                        Text(selectedCustomer?.name ?: "Seleccionar cliente", modifier = Modifier.weight(1f))
-                        Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                    OutlinedButton(onClick = { menu = true }, modifier = Modifier.fillMaxWidth()) {
+                        Text(selected?.name ?: "Seleccionar cliente", Modifier.weight(1f)); Icon(Icons.Default.ArrowDropDown, null)
                     }
-                    DropdownMenu(expanded = customerMenu, onDismissRequest = { customerMenu = false }) {
-                        availableCustomers.forEach { c ->
-                            DropdownMenuItem(text = { Text(c.name) }, onClick = { customerId = c.id; customerMenu = false })
-                        }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        available.forEach { c -> DropdownMenuItem(text = { Text(c.name) }, onClick = { customerId = c.id; menu = false }) }
                     }
                 }
                 MoneyField("Pago del cliente", paid) { paid = it }
                 MoneyField("Máximo autorizado para mercancía", limit) { limit = it }
-                val paidCents = parseMoney(paid)
-                val limitCents = parseMoney(limit)
-                if (paidCents != null && limitCents != null && paidCents >= limitCents) {
-                    val fee = paidCents - limitCents
-                    val pct = if (limitCents > 0) fee * 100.0 / limitCents else 0.0
-                    Text("Servicio/diferencia: ${money(fee)} · ${String.format(Locale.US, "%.2f", pct)}%")
-                }
+                val pc = parseMoney(paid); val lc = parseMoney(limit)
+                if (pc != null && lc != null && pc >= lc) Text("Servicio/diferencia: ${money(pc - lc)}")
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
         },
         confirmButton = {
             Button(onClick = {
-                val paidCents = parseMoney(paid)
-                val limitCents = parseMoney(limit)
+                val pc = parseMoney(paid); val lc = parseMoney(limit)
                 when {
                     customerId.isBlank() -> error = "Selecciona un cliente"
-                    paidCents == null || limitCents == null -> error = "Revisa los montos"
-                    paidCents < limitCents -> error = "El pago no puede ser menor que el máximo autorizado"
-                    state.addOrder(customerId, paidCents, limitCents) == null -> error = "No se pudo crear la orden"
+                    pc == null || lc == null -> error = "Revisa los montos"
+                    pc < lc -> error = "El pago no puede ser menor que el máximo"
+                    state.addOrder(customerId, pc, lc) == null -> error = "No se pudo crear la orden"
                     else -> onDismiss()
                 }
             }) { Text("Crear orden") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
+    )
+}
+
+@Composable
+private fun EditOrderDialog(state: AppState, order: SpendOrder, onDismiss: () -> Unit) {
+    var paid by remember(order.id) { mutableStateOf(decimal(order.paidCents)) }
+    var limit by remember(order.id) { mutableStateOf(decimal(order.purchaseLimitCents)) }
+    var message by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Editar ${order.orderRef}") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                MoneyField("Pago del cliente", paid) { paid = it }
+                MoneyField("Máximo autorizado", limit) { limit = it }
+                Text("Ya usado/reservado: ${money(order.usedCents + order.reservedCents)}", style = MaterialTheme.typography.bodySmall)
+                message?.let { Text(it, color = if (it == "Orden actualizada") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val pc = parseMoney(paid); val lc = parseMoney(limit)
+                if (pc == null || lc == null) message = "Revisa los montos"
+                else {
+                    message = state.updateOrder(order.id, pc, lc)
+                    if (message == "Orden actualizada") onDismiss()
+                }
+            }) { Text("Guardar") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
     )
@@ -628,27 +830,16 @@ private fun NewPurchaseDialog(state: AppState, order: SpendOrder, onDismiss: () 
     var description by remember { mutableStateOf("") }
     var amount by remember { mutableStateOf("") }
     var message by remember { mutableStateOf<String?>(null) }
-    var merchantMenu by remember { mutableStateOf(false) }
+    var menu by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Nueva compra · ${order.orderRef}") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("${state.customerName(order.customerId)} · Disponible ${money(order.remainingCents)}")
-                Box {
-                    OutlinedButton(onClick = { merchantMenu = true }, modifier = Modifier.fillMaxWidth()) {
-                        Text(if (merchant.isBlank()) "Seleccionar comercio" else merchant, modifier = Modifier.weight(1f))
-                        Icon(Icons.Default.ArrowDropDown, contentDescription = null)
-                    }
-                    DropdownMenu(expanded = merchantMenu, onDismissRequest = { merchantMenu = false }) {
-                        state.allowedMerchants.forEach { m ->
-                            DropdownMenuItem(text = { Text(m) }, onClick = { merchant = m; merchantMenu = false })
-                        }
-                    }
-                }
-                OutlinedTextField(value = description, onValueChange = { description = it }, label = { Text("Producto / descripción") }, modifier = Modifier.fillMaxWidth())
+                MerchantSelector(state.allowedMerchants, merchant, { merchant = it }, menu, { menu = it })
+                OutlinedTextField(description, { description = it }, label = { Text("Producto / descripción") }, modifier = Modifier.fillMaxWidth())
                 MoneyField("Total final de compra", amount) { amount = it }
-                Text("SpendCore verificará el límite antes de crear la tarjeta temporal.", style = MaterialTheme.typography.bodySmall)
                 message?.let { Text(it, color = if (it.startsWith("Autorizada")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error) }
             }
         },
@@ -668,19 +859,78 @@ private fun NewPurchaseDialog(state: AppState, order: SpendOrder, onDismiss: () 
 }
 
 @Composable
-private fun NameDialog(title: String, label: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
-    var value by remember { mutableStateOf("") }
+private fun EditPurchaseDialog(state: AppState, purchase: Purchase, onDismiss: () -> Unit) {
+    var merchant by remember(purchase.id) { mutableStateOf(purchase.merchant) }
+    var description by remember(purchase.id) { mutableStateOf(purchase.description) }
+    var amount by remember(purchase.id) { mutableStateOf(decimal(purchase.amountCents)) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var menu by remember { mutableStateOf(false) }
+    val editableFinancials = purchase.status == "AUTHORIZED"
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = { OutlinedTextField(value = value, onValueChange = { value = it }, label = { Text(label) }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
-        confirmButton = { Button(onClick = { if (value.isNotBlank()) onSave(value) }, enabled = value.isNotBlank()) { Text("Guardar") } },
+        title = { Text("Editar compra") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (editableFinancials) MerchantSelector(state.allowedMerchants, merchant, { merchant = it }, menu, { menu = it })
+                else OutlinedTextField(merchant, {}, label = { Text("Comercio") }, enabled = false, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(description, { description = it }, label = { Text("Descripción") }, modifier = Modifier.fillMaxWidth())
+                MoneyField("Monto", amount, enabled = editableFinancials) { amount = it }
+                if (!editableFinancials) Text("Al estar procesada, solo se puede corregir la descripción.", style = MaterialTheme.typography.bodySmall)
+                message?.let { Text(it, color = if (it.contains("actualizada")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val cents = parseMoney(amount)
+                if (cents == null) message = "Monto inválido"
+                else {
+                    message = state.updatePurchase(purchase.id, merchant, description, cents)
+                    if (message!!.contains("actualizada")) onDismiss()
+                }
+            }) { Text("Guardar") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
     )
 }
 
 @Composable
-private fun MoneyField(label: String, value: String, onValueChange: (String) -> Unit) {
+private fun MerchantSelector(merchants: List<String>, current: String, onSelect: (String) -> Unit, expanded: Boolean, onExpanded: (Boolean) -> Unit) {
+    Box {
+        OutlinedButton(onClick = { onExpanded(true) }, modifier = Modifier.fillMaxWidth()) {
+            Text(if (current.isBlank()) "Seleccionar comercio" else current, Modifier.weight(1f)); Icon(Icons.Default.ArrowDropDown, null)
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { onExpanded(false) }) {
+            merchants.forEach { m -> DropdownMenuItem(text = { Text(m) }, onClick = { onSelect(m); onExpanded(false) }) }
+        }
+    }
+}
+
+@Composable
+private fun NameDialog(title: String, label: String, initialValue: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var value by remember(initialValue) { mutableStateOf(initialValue) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { OutlinedTextField(value, { value = it }, label = { Text(label) }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
+        confirmButton = { Button(onClick = { onSave(value.trim()) }, enabled = value.isNotBlank()) { Text("Guardar") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
+    )
+}
+
+@Composable
+private fun ConfirmDeleteDialog(title: String, message: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Default.Warning, null) },
+        title = { Text(title) },
+        text = { Text(message) },
+        confirmButton = { Button(onClick = onConfirm) { Text("Borrar") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancelar") } }
+    )
+}
+
+@Composable
+private fun MoneyField(label: String, value: String, enabled: Boolean = true, onValueChange: (String) -> Unit) {
     OutlinedTextField(
         value = value,
         onValueChange = { next -> if (next.matches(Regex("^\\d{0,8}([.]\\d{0,2})?$"))) onValueChange(next) },
@@ -688,6 +938,7 @@ private fun MoneyField(label: String, value: String, onValueChange: (String) -> 
         prefix = { Text("$") },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
         singleLine = true,
+        enabled = enabled,
         modifier = Modifier.fillMaxWidth()
     )
 }
@@ -696,9 +947,7 @@ private fun MoneyField(label: String, value: String, onValueChange: (String) -> 
 private fun MetricCard(label: String, value: String, icon: androidx.compose.ui.graphics.vector.ImageVector) {
     Card(Modifier.fillMaxWidth()) {
         Row(Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(icon, contentDescription = null)
-            Spacer(Modifier.width(14.dp))
-            Column {
+            Icon(icon, null); Spacer(Modifier.width(14.dp)); Column {
                 Text(label, style = MaterialTheme.typography.labelLarge)
                 Text(value, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
             }
@@ -706,19 +955,12 @@ private fun MetricCard(label: String, value: String, icon: androidx.compose.ui.g
     }
 }
 
-@Composable
-private fun EmptyCard(text: String) {
-    Card(Modifier.fillMaxWidth()) { Text(text, Modifier.padding(18.dp)) }
-}
-
-@Composable
-private fun RuleLine(name: String, allowed: Boolean) {
-    ListItem(
-        headlineContent = { Text(name) },
-        trailingContent = { Icon(if (allowed) Icons.Default.Check else Icons.Default.Block, contentDescription = null) }
-    )
+@Composable private fun EmptyCard(text: String) { Card(Modifier.fillMaxWidth()) { Text(text, Modifier.padding(18.dp)) } }
+@Composable private fun RuleLine(name: String, allowed: Boolean) {
+    ListItem(headlineContent = { Text(name) }, trailingContent = { Icon(if (allowed) Icons.Default.Check else Icons.Default.Block, null) })
 }
 
 private fun parseMoney(value: String): Long? = value.toDoubleOrNull()?.let { (it * 100.0).roundToLong() }?.takeIf { it > 0 }
 private fun money(cents: Long): String = "$" + String.format(Locale.US, "%.2f", cents / 100.0)
+private fun decimal(cents: Long): String = String.format(Locale.US, "%.2f", cents / 100.0)
 private fun formatDate(timestamp: Long): String = SimpleDateFormat("MMM d, h:mm a", Locale.US).format(Date(timestamp))
