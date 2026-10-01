@@ -80,6 +80,9 @@ class CardIntent(BaseModel):
     merchant_lock: str
     single_use: bool = True
     status: str = "READY"
+    expiration: Optional[str] = None
+    user_ref: Optional[str] = None
+    last_synced_at: Optional[str] = None
 
 
 class PurchaseRequest(BaseModel):
