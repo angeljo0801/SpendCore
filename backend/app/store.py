@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import sqlite3
-from pathlib import Path
 from threading import RLock
 from .models import AuditEvent, Budget, Business, PurchaseRequest
 
@@ -26,6 +24,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS budgets (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS purchases (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, business_id TEXT NOT NULL, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS webhook_events (event_key TEXT PRIMARY KEY, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
                 """
             )
 
@@ -58,6 +57,12 @@ class Store:
     def get_purchase(self, obj_id: str): return self._get("purchases", obj_id, PurchaseRequest)
     def list_purchases(self): return self._list("purchases", PurchaseRequest)
 
+    def find_purchase_by_provider_ref(self, provider_ref: str):
+        for purchase in self.list_purchases():
+            if purchase.card_intent and purchase.card_intent.provider_ref == provider_ref:
+                return purchase
+        return None
+
     def add_audit(self, event: AuditEvent):
         with self.lock, self._connect() as conn:
             conn.execute(
@@ -71,3 +76,12 @@ class Store:
                 "SELECT payload FROM audit WHERE business_id = ? ORDER BY rowid DESC", (business_id,)
             ).fetchall()
         return [AuditEvent.model_validate_json(r["payload"]) for r in rows]
+
+    def webhook_seen(self, event_key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM webhook_events WHERE event_key = ?", (event_key,)).fetchone()
+        return row is not None
+
+    def mark_webhook_seen(self, event_key: str) -> None:
+        with self.lock, self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO webhook_events (event_key) VALUES (?)", (event_key,))
