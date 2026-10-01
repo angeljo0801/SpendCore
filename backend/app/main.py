@@ -159,6 +159,11 @@ def get_budget(budget_id: str):
 
 @app.post("/v1/purchase-requests", response_model=PurchaseRequest)
 def create_purchase_request(body: PurchaseRequestCreate):
+    if body.external_order_ref:
+        existing = store.find_purchase_by_external_order_ref(body.business_id, body.external_order_ref)
+        if existing:
+            return existing
+
     budget = store.get_budget(body.budget_id)
     if not budget:
         raise HTTPException(404, "Budget not found")
