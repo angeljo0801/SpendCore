@@ -61,7 +61,7 @@ class AppState(private val context: Context) {
         if (selectedBusinessId == null) selectedBusinessId = businesses.firstOrNull()?.id
     }
 
-    fun setApiBaseUrl(value: String) {
+    fun saveApiBaseUrl(value: String) {
         apiBaseUrl = value.trim().trimEnd('/')
         prefs.edit().putString("api_base_url", apiBaseUrl).apply()
     }
